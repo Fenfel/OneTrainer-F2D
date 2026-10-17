@@ -28,6 +28,10 @@ class ModelTabController:
             or model_type.is_hunyuan_video()
         )
 
+    def supports_override_text_encoder(self) -> bool:
+        # GGUF text encoder overrides are currently implemented only for Flux.2-dev (Mistral TE)
+        return self.train_config.model_type.is_flux_2()
+
     def get_output_formats(self) -> list[tuple[str, ModelFormat]]:
         labels = {
             ModelFormat.SAFETENSORS: "Safetensors",

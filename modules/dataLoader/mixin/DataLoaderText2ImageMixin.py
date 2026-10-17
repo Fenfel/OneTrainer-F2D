@@ -334,6 +334,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     ):
         image_cache_dir = os.path.join(config.cache_dir, "image")
         text_cache_dir = os.path.join(config.cache_dir, "text")
+        # the text cache key (mgds DiskCache) only hashes prompt/concept data, not the text encoder
+        # itself - so switching the text encoder (e.g. to a quantized GGUF override) would silently
+        # reuse stale embeddings. Isolate the text cache per text encoder override.
+        te_override = config.text_encoder.model_name
+        if te_override:
+            import hashlib
+            te_tag = hashlib.sha256(te_override.encode("utf-8")).hexdigest()[:12]
+            text_cache_dir = os.path.join(text_cache_dir, f"te-{te_tag}")
 
         if before_cache_image_fun is None:
             def prepare_vae():

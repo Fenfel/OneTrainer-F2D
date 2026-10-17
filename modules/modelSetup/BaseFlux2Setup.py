@@ -36,11 +36,20 @@ class BaseFlux2Setup(
         "full": [],
     }
 
+    @staticmethod
+    def _check_gguf_te_constraints(config: TrainConfig):
+        if config.text_encoder.model_name and config.text_encoder.train:
+            raise ValueError(
+                "The text encoder is overridden with a quantized GGUF file and must stay frozen. "
+                "Disable 'Train Text Encoder' or remove the GGUF text encoder override."
+            )
+
     def setup_optimizations(
             self,
             model: Flux2Model,
             config: TrainConfig,
     ):
+        self._check_gguf_te_constraints(config)
         text_encoder_checkpointing_fn = enable_checkpointing_for_mistral_encoder_layers if model.is_dev() \
             else enable_checkpointing_for_qwen3_encoder_layers
         super().setup_optimizations(model, config)

@@ -36,6 +36,7 @@ class BaseModelTabView(ABC):
             allow_override_transformer=controller.supports_override_transformer(),
             has_unconditional_transformer="unconditional_transformer" in parts,
             has_text_encoder=not model_type.has_multiple_text_encoders(),
+            allow_override_text_encoder=controller.supports_override_text_encoder(),
             has_text_encoder_1=model_type.has_multiple_text_encoders(),
             has_text_encoder_2="text_encoder_2" in parts,
             has_text_encoder_3="text_encoder_3" in parts,
@@ -144,6 +145,7 @@ class BaseModelTabView(ABC):
             has_unconditional_transformer: bool = False,
             allow_override_text_encoder_4: bool = False,
             has_text_encoder: bool = False,
+            allow_override_text_encoder: bool = False,
             has_text_encoder_1: bool = False,
             has_text_encoder_2: bool = False,
             has_text_encoder_3: bool = False,
@@ -231,6 +233,15 @@ class BaseModelTabView(ABC):
         row += 1
 
         if has_text_encoder:
+            if allow_override_text_encoder:
+                # text encoder model override (GGUF)
+                self.components.label(frame, row, 0, "Override Text Encoder / GGUF",
+                                 tooltip="Can be used to override the text encoder in the base model with a quantized GGUF file (Flux.2-dev Mistral only). The text encoder stays frozen and the full unquantized text encoder is never loaded.")
+                self.components.path_entry(
+                    frame, row, 1, ui_state, "text_encoder.model_name",
+                    mode="file", path_modifier=path_util.json_path_modifier
+                )
+
             # text encoder weight dtype
             self.components.label(frame, row, 3, "Text Encoder Data Type",
                              tooltip="The text encoder weight data type")

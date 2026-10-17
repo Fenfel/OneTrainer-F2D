@@ -16,6 +16,7 @@ class ModelNames:
             transformer_model: str = "",
             effnet_encoder_model: str = "",
             decoder_model: str = "",
+            text_encoder_model: str = "",
             text_encoder_4: str = "",
             vae_model: str = "",
             lora: str = "",
@@ -32,6 +33,7 @@ class ModelNames:
         self.transformer_model = transformer_model
         self.effnet_encoder_model = effnet_encoder_model
         self.decoder_model = decoder_model
+        self.text_encoder_model = text_encoder_model
         self.text_encoder_4 = text_encoder_4
         self.vae_model = vae_model
         self.lora = lora

@@ -898,6 +898,7 @@ class TrainConfig(BaseConfig):
             transformer_model=self.transformer.model_name,
             effnet_encoder_model=self.effnet_encoder.model_name,
             decoder_model=self.decoder.model_name,
+            text_encoder_model=self.text_encoder.model_name,
             text_encoder_4=self.text_encoder_4.model_name,
             vae_model=self.vae.model_name,
             lora=self.lora_model_name,

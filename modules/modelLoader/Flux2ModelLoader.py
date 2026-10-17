@@ -4,6 +4,7 @@ import traceback
 from modules.model.Flux2Model import Flux2Model
 from modules.modelLoader.GenericFineTuneModelLoader import make_fine_tune_model_loader
 from modules.modelLoader.GenericLoRAModelLoader import make_lora_model_loader
+from modules.modelLoader.mixin.GGUFTextEncoderLoaderMixin import GGUFTextEncoderLoaderMixin
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.modelLoader.mixin.LoRALoaderMixin import LoRALoaderMixin
 from modules.util.config.TrainConfig import QuantizationConfig
@@ -20,6 +21,7 @@ from diffusers import (
     GGUFQuantizationConfig,
 )
 from transformers import (
+    Mistral3Config,
     Mistral3ForConditionalGeneration,
     PixtralProcessor,
     Qwen2Tokenizer,
@@ -29,6 +31,7 @@ from transformers import (
 
 class Flux2ModelLoader(
     HFModelLoaderMixin,
+    GGUFTextEncoderLoaderMixin,
 ):
     def __init__(self):
         super().__init__()
@@ -40,12 +43,14 @@ class Flux2ModelLoader(
             weight_dtypes: ModelWeightDtypes,
             base_model_name: str,
             transformer_model_name: str,
+            text_encoder_model_name: str,
             vae_model_name: str,
             quantization: QuantizationConfig,
     ):
         if os.path.isfile(os.path.join(base_model_name, "meta.json")):
             self.__load_diffusers(
-                model, model_type, weight_dtypes, base_model_name, transformer_model_name, vae_model_name, quantization,
+                model, model_type, weight_dtypes, base_model_name, transformer_model_name,
+                text_encoder_model_name, vae_model_name, quantization,
             )
         else:
             raise Exception("not an internal model")
@@ -57,6 +62,7 @@ class Flux2ModelLoader(
             weight_dtypes: ModelWeightDtypes,
             base_model_name: str,
             transformer_model_name: str,
+            text_encoder_model_name: str,
             vae_model_name: str,
             quantization: QuantizationConfig,
     ):
@@ -88,14 +94,32 @@ class Flux2ModelLoader(
                 subfolder="tokenizer",
             ).tokenizer
 
-            text_encoder = self._load_transformers_sub_module(
-                Mistral3ForConditionalGeneration,
-                weight_dtypes.text_encoder,
-                weight_dtypes.fallback_train_dtype,
-                base_model_name,
-                "text_encoder",
-            )
+            if text_encoder_model_name:
+                # a GGUF file overrides the stock text encoder; the full BF16 TE is never loaded
+                text_config = Mistral3Config.from_pretrained(
+                    base_model_name,
+                    subfolder="text_encoder",
+                ).text_config
+                compute_dtype = weight_dtypes.text_encoder.torch_dtype() or torch.bfloat16
+                text_encoder = self._load_gguf_text_encoder(
+                    text_encoder_model_name,
+                    text_config,
+                    compute_dtype,
+                )
+            else:
+                text_encoder = self._load_transformers_sub_module(
+                    Mistral3ForConditionalGeneration,
+                    weight_dtypes.text_encoder,
+                    weight_dtypes.fallback_train_dtype,
+                    base_model_name,
+                    "text_encoder",
+                )
         else: #Flux2.Klein
+            if text_encoder_model_name:
+                raise ValueError(
+                    "Overriding the text encoder with a GGUF file is only supported for Flux.2-dev (Mistral), "
+                    "not for Flux.2.Klein (Qwen3)."
+                )
             tokenizer = Qwen2Tokenizer.from_pretrained(
                 base_model_name,
                 subfolder="tokenizer",
@@ -143,6 +167,7 @@ class Flux2ModelLoader(
             weight_dtypes: ModelWeightDtypes,
             base_model_name: str,
             transformer_model_name: str,
+            text_encoder_model_name: str,
             vae_model_name: str,
             quantization: QuantizationConfig,
     ):
@@ -157,11 +182,24 @@ class Flux2ModelLoader(
             weight_dtypes: ModelWeightDtypes,
             quantization: QuantizationConfig,
     ):
+        text_encoder_model_name = model_names.text_encoder_model
+        if text_encoder_model_name:
+            # validate the TE override up front: an invalid override must fail directly,
+            # never silently fall back to the full stock TE
+            if not text_encoder_model_name.lower().endswith(".gguf"):
+                raise ValueError(
+                    "The text encoder override must be a GGUF file "
+                    f"(only quantized GGUF text encoders are supported): {text_encoder_model_name}"
+                )
+            if not os.path.isfile(text_encoder_model_name):
+                raise FileNotFoundError(f"GGUF text encoder file not found: {text_encoder_model_name}")
+
         stacktraces = []
 
         try:
             self.__load_internal(
-                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model, model_names.vae_model, quantization,
+                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model,
+                text_encoder_model_name, model_names.vae_model, quantization,
             )
             return
         except Exception:
@@ -169,7 +207,8 @@ class Flux2ModelLoader(
 
         try:
             self.__load_diffusers(
-                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model, model_names.vae_model, quantization,
+                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model,
+                text_encoder_model_name, model_names.vae_model, quantization,
             )
             return
         except Exception:
@@ -177,7 +216,8 @@ class Flux2ModelLoader(
 
         try:
             self.__load_safetensors(
-                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model, model_names.vae_model, quantization,
+                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model,
+                text_encoder_model_name, model_names.vae_model, quantization,
             )
             return
         except Exception:
