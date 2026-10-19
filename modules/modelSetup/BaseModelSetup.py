@@ -34,6 +34,10 @@ class BaseModelSetup(
         self.temp_device = temp_device
         self.debug_mode = debug_mode
         self.frozen_parameters = {}
+        # model parts whose per-part optimizations (quantization, checkpointing conductor, fp16
+        # autocast override) were already applied. Staged loading calls setup_optimizations once
+        # per loaded component; parts must never be optimized twice.
+        self.optimized_parts: set[str] = set()
 
     @abstractmethod
     def create_parameters(
@@ -52,6 +56,19 @@ class BaseModelSetup(
         # Leaves call super() first, so model.train_dtype is set before their _setup_model_part calls read it.
         model.train_dtype = config.train_dtype
         model.autocast_context = create_autocast_context(self.train_device, config.train_dtype, config.enable_autocast_cache)
+
+    def validate_pre_load(
+            self,
+            config: TrainConfig,
+    ):
+        # Cheap config validation that must run before the (potentially huge) model is loaded.
+        # Setups override this to reject unsupported combinations early, with a clear error,
+        # instead of failing after gigabytes of weights were loaded.
+        if config.release_text_encoder_after_cache:
+            raise ValueError(
+                "'Release text encoder after cache' is only supported for Flux.2 setups. Disable it "
+                "for this model."
+            )
 
     @abstractmethod
     def setup_model(
@@ -254,6 +271,11 @@ class BaseModelSetup(
         module = getattr(model, attr)
         if module is None:
             return
+        if attr in self.optimized_parts:
+            # staged loading re-runs the optimizations after each component is loaded; applying
+            # quantization or a checkpointing conductor twice would corrupt the first pass
+            return
+        self.optimized_parts.add(attr)
 
         if checkpointing_fn is not None:
             conductor = checkpointing_fn(module, config, config_part)

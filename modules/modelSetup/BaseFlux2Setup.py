@@ -16,6 +16,7 @@ from modules.util.checkpointing_util import (
     enable_checkpointing_for_qwen3_encoder_layers,
 )
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -44,6 +45,34 @@ class BaseFlux2Setup(
                 "Disable 'Train Text Encoder' or remove the GGUF text encoder override."
             )
 
+    def validate_pre_load(
+            self,
+            config: TrainConfig,
+    ):
+        if not config.release_text_encoder_after_cache:
+            return
+        if config.training_method != TrainingMethod.LORA:
+            raise ValueError(
+                "'Release text encoder after cache' currently supports only transformer LoRA training "
+                "(the MVP). Disable it or switch the training method."
+            )
+        if not config.latent_caching:
+            raise ValueError(
+                "'Release text encoder after cache' requires latent caching, because the text embeddings "
+                "must be on disk before the text encoder can be freed. Enable 'Latent Caching'."
+            )
+        if config.text_encoder.train:
+            raise ValueError(
+                "'Release text encoder after cache' requires a frozen text encoder. "
+                "Disable 'Train Text Encoder'."
+            )
+        if config.any_samples_enabled():
+            raise ValueError(
+                "'Release text encoder after cache' cannot be used with enabled samples: sampling encodes "
+                "its prompts with the text encoder, which is freed after caching. Disable the samples "
+                "(or the 'Sample' entries in the Sampling tab) to use this mode."
+            )
+
     def setup_optimizations(
             self,
             model: Flux2Model,
@@ -57,7 +86,8 @@ class BaseFlux2Setup(
         self._setup_model_part(model, config, "text_encoder", config.text_encoder, text_encoder_checkpointing_fn, disable_fp16_autocast=True)
         self._setup_model_part(model, config, "vae", config.vae)
 
-        self._set_attention_backend(model.transformer, config.attention_mechanism, mask=False)
+        if model.transformer is not None:
+            self._set_attention_backend(model.transformer, config.attention_mechanism, mask=False)
 
     def predict(
             self,
@@ -174,5 +204,17 @@ class BaseFlux2Setup(
         ).mean()
 
     def prepare_text_caching(self, model: FluxModel, config: TrainConfig):
+        if model.text_encoder is None:
+            if getattr(model, "text_encoder_released", False):
+                raise RuntimeError(
+                    "Text caching is needed but the text encoder was already released "
+                    "(release_text_encoder_after_cache). The text cache became incomplete or was invalidated "
+                    "during this run. Restart the training so the cache can be rebuilt, or disable "
+                    "release_text_encoder_after_cache."
+                )
+            raise RuntimeError(
+                "Text caching is needed but no text encoder is loaded. "
+                "Enable 'Include Text Encoder' or disable text caching."
+            )
         model.materialize_only("text_encoder")
         model.eval()

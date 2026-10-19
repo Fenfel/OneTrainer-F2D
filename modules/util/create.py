@@ -108,7 +108,8 @@ def create_data_loader(
         training_method: TrainingMethod = TrainingMethod.FINE_TUNE,
         config: TrainConfig = None,
         train_progress: TrainProgress | None = None,
-        is_validation: bool = False
+        is_validation: bool = False,
+        cache_warming_stage: str | None = None,
 ) -> BaseDataLoader | None:
     # Layer offloading uses a non-thread-safe conductor. Only text encoders run inside the caching dataloader's
     # worker threads (to produce the text cache), so only their offload_fraction can conflict with threading.
@@ -123,7 +124,7 @@ def create_data_loader(
     cls = factory.get(BaseDataLoader, model_type, training_method)
     if cls is None:
         cls = factory.get(BaseDataLoader, model_type)
-    return cls(train_device, temp_device, config, model, model_setup, train_progress, is_validation) if cls is not None else None
+    return cls(train_device, temp_device, config, model, model_setup, train_progress, is_validation, cache_warming_stage) if cls is not None else None
 
 def create_optimizer(
         parameter_group_collection: NamedParameterGroupCollection,

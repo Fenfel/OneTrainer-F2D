@@ -63,6 +63,16 @@ class Flux2Model(BaseModel):
         self.vae = None
         self.transformer = None
 
+        # the transformer config read from the model directory before the transformer weights exist.
+        # is_dev() falls back to it while the transformer is not loaded (staged loading mode).
+        self.transformer_config = None
+
+        # independent copies of the VAE batch-norm stats, saved before the VAE is released
+        # (release_text_encoder_after_cache) so scale_latents()/unscale_latents() keep working
+        self.vae_bn_running_mean = None
+        self.vae_bn_running_var = None
+        self.vae_batch_norm_eps = None
+
         self.text_encoder_autocast_context = nullcontext()
 
         self.text_encoder_offload_conductor = None
@@ -144,6 +154,16 @@ class Flux2Model(BaseModel):
             text_encoder_output: Tensor = None,
     ) -> tuple[Tensor, Tensor]:
 
+        if text_encoder_output is None and self.text_encoder is None:
+            raise RuntimeError(
+                "Cannot encode text: no cached text_encoder_hidden_state in the batch and the text encoder "
+                + ("was released after text caching (release_text_encoder_after_cache). The text cache is "
+                   "incomplete or was invalidated; restart the training so it can be rebuilt, or disable "
+                   "release_text_encoder_after_cache."
+                   if getattr(self, "text_encoder_released", False) else
+                   "is not loaded. Enable 'Include Text Encoder' or enable text caching.")
+            )
+
         if tokens is None and text is not None:
             if isinstance(text, str):
                 text = [text]
@@ -202,7 +222,15 @@ class Flux2Model(BaseModel):
         return text_encoder_output
 
     def is_dev(self) -> bool:
-        return self.transformer.config.num_attention_heads == 48
+        # Before the transformer weights are loaded (staged loading mode) the architecture is read
+        # from the transformer config that load_metadata() picked up from the model directory.
+        if self.transformer is not None:
+            return self.transformer.config.num_attention_heads == 48
+        if self.transformer_config is not None:
+            return self.transformer_config["num_attention_heads"] == 48
+        raise RuntimeError(
+            "Cannot determine the Flux.2 variant: neither the transformer nor its config is loaded yet."
+        )
 
     def is_klein(self) -> bool:
         return not self.is_dev()
@@ -282,17 +310,40 @@ class Flux2Model(BaseModel):
         return latents
 
     #scaling on patchified latents
+    def save_vae_bn_stats(self) -> None:
+        # Keep detached CPU clones of the VAE batch-norm stats so latents can still be scaled after
+        # the VAE itself was released. The clones must not reference the VAE in any way.
+        if self.vae is None:
+            return
+        self.vae_bn_running_mean = self.vae.bn.running_mean.detach().cpu().clone()
+        self.vae_bn_running_var = self.vae.bn.running_var.detach().cpu().clone()
+        self.vae_batch_norm_eps = float(self.vae.config.batch_norm_eps)
+
+    def _vae_bn_stats(self) -> tuple[Tensor, Tensor, float]:
+        if self.vae is not None:
+            return self.vae.bn.running_mean, self.vae.bn.running_var, self.vae.config.batch_norm_eps
+        if self.vae_bn_running_mean is None or self.vae_bn_running_var is None \
+                or self.vae_batch_norm_eps is None:
+            raise RuntimeError(
+                "Cannot scale latents: the VAE is not loaded and its batch-norm stats were not saved. "
+                "With release_text_encoder_after_cache the stats are saved right before the VAE is "
+                "released; restart the training so the staged loading runs again."
+            )
+        return self.vae_bn_running_mean, self.vae_bn_running_var, self.vae_batch_norm_eps
+
     def scale_latents(self, latents: Tensor) -> Tensor:
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+        bn_running_mean, bn_running_var, batch_norm_eps = self._vae_bn_stats()
+        latents_bn_mean = bn_running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        latents_bn_std = torch.sqrt(bn_running_var.view(1, -1, 1, 1) + batch_norm_eps).to(
             latents.device, latents.dtype
         )
         return (latents - latents_bn_mean) / latents_bn_std
 
 
     def unscale_latents(self, latents: Tensor) -> Tensor:
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+        bn_running_mean, bn_running_var, batch_norm_eps = self._vae_bn_stats()
+        latents_bn_mean = bn_running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        latents_bn_std = torch.sqrt(bn_running_var.view(1, -1, 1, 1) + batch_norm_eps).to(
             latents.device, latents.dtype
         )
         return latents * latents_bn_std + latents_bn_mean

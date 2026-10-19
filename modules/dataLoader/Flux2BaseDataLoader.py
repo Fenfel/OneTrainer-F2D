@@ -34,11 +34,18 @@ class Flux2BaseDataLoader(
     BaseDataLoader,
     DataLoaderText2ImageMixin,
 ):
-    def _preparation_modules(self, config: TrainConfig, model: Flux2Model):
+    def _image_preparation_modules(self, config: TrainConfig, model: Flux2Model):
         rescale_image = RescaleImageChannels(image_in_name='image', image_out_name='image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
         encode_image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
         image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
         downscale_mask = ScaleImage(in_name='mask', out_name='latent_mask', factor=0.125)
+
+        modules = [rescale_image, encode_image, image_sample]
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(downscale_mask)
+        return modules
+
+    def _text_preparation_modules(self, config: TrainConfig, model: Flux2Model):
         if model.is_dev():
             tokenize_prompt = Tokenize(in_name='prompt', tokens_out_name='tokens', mask_out_name='tokens_mask', tokenizer=model.tokenizer, max_token_length=config.text_encoder_sequence_length,
                                         apply_chat_template = lambda caption: mistral_format_input([caption], MISTRAL_SYSTEM_MESSAGE), apply_chat_template_kwargs = {'add_generation_prompt': False},
@@ -54,15 +61,15 @@ class Flux2BaseDataLoader(
             encode_prompt = EncodeQwenText(tokens_name='tokens', tokens_attention_mask_in_name='tokens_mask', hidden_state_out_name='text_encoder_hidden_state', tokens_attention_mask_out_name='tokens_mask',
                                            text_encoder=model.text_encoder, hidden_state_output_index=QWEN3_HIDDEN_STATES_LAYERS, autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
 
+        return [tokenize_prompt, encode_prompt]
 
-        modules = [rescale_image, encode_image, image_sample]
-        if config.masked_training or config.model_type.has_mask_input():
-            modules.append(downscale_mask)
+    def _preparation_modules(self, config: TrainConfig, model: Flux2Model):
+        # image part first, then text part: the slim cache-warming pipelines of the staged loading
+        # mode reuse these two halves and rely on this exact order to keep the module indices
+        # (and with them the augmentation seeds and cache keys) identical to the full pipeline
+        return self._image_preparation_modules(config, model) + self._text_preparation_modules(config, model)
 
-        modules += [tokenize_prompt, encode_prompt]
-        return modules
-
-    def _cache_modules(self, config: TrainConfig, model: Flux2Model, model_setup: BaseFlux2Setup):
+    def _cache_names(self, config: TrainConfig):
         image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
 
         if config.masked_training or config.model_type.has_mask_input():
@@ -70,14 +77,17 @@ class Flux2BaseDataLoader(
 
         image_aggregate_names = ['crop_resolution', 'image_path']
 
-        text_split_names = []
+        text_split_names = ['tokens', 'tokens_mask', 'text_encoder_hidden_state']
 
         sort_names = image_aggregate_names + image_split_names + [
             'prompt', 'tokens', 'tokens_mask', 'text_encoder_hidden_state',
             'concept'
         ]
 
-        text_split_names += ['tokens', 'tokens_mask', 'text_encoder_hidden_state']
+        return image_split_names, image_aggregate_names, text_split_names, sort_names
+
+    def _cache_modules(self, config: TrainConfig, model: Flux2Model, model_setup: BaseFlux2Setup):
+        image_split_names, image_aggregate_names, text_split_names, sort_names = self._cache_names(config)
 
         return self._cache_modules_from_names(
             model, model_setup,
@@ -153,6 +163,19 @@ class Flux2BaseDataLoader(
             train_progress: TrainProgress,
             is_validation: bool = False,
     ):
+        # the staged loading mode builds slim pipelines that warm only one cache at a time
+        # (see BaseDataLoader.cache_warming_stage); the training pipeline itself is always
+        # the full one
+        if self._cache_warming_stage == "text":
+            return self._create_text_cache_warming_dataset(
+                config, model, model_setup, train_progress, is_validation,
+                aspect_bucketing_quantization=64,
+            )
+        if self._cache_warming_stage == "image":
+            return self._create_image_cache_warming_dataset(
+                config, model, model_setup, train_progress, is_validation,
+                aspect_bucketing_quantization=64,
+            )
         return DataLoaderText2ImageMixin._create_dataset(self,
             config, model, model_setup, train_progress, is_validation,
             aspect_bucketing_quantization=64,

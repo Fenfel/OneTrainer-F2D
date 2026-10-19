@@ -55,6 +55,79 @@ def make_lora_model_loader(
 
             return model
 
+        # Staged loading API (release_text_encoder_after_cache): build the model and load its
+        # components one at a time, in the order the caching stages need. Only model loaders that
+        # implement the per-component methods (currently Flux.2) support this.
+
+        def _staged_base_loader(self):
+            base_model_loader = model_loader_class()
+            if not hasattr(base_model_loader, "load_metadata"):
+                raise NotImplementedError(
+                    "staged loading is not supported for this model loader: it has no per-component load methods"
+                )
+            return base_model_loader
+
+        def create_model(
+                self,
+                model_type: ModelType,
+                model_names: ModelNames,
+        ) -> model_class:
+            # create the model and load internal data (train progress, optimizer state) and the
+            # model spec, but no component weights yet
+            model = model_class(model_type=model_type)
+            self._load_internal_data(model, model_names.lora)
+            model.model_spec = self._load_default_model_spec(model_type)
+            return model
+
+        def load_metadata(
+                self,
+                model: BaseModel,
+                model_type: ModelType,
+                model_names: ModelNames,
+                weight_dtypes: ModelWeightDtypes,
+                quantization: QuantizationConfig,
+        ):
+            self._staged_base_loader().load_metadata(model, model_type, model_names, weight_dtypes, quantization)
+
+        def load_text_encoder(
+                self,
+                model: BaseModel,
+                model_type: ModelType,
+                model_names: ModelNames,
+                weight_dtypes: ModelWeightDtypes,
+                quantization: QuantizationConfig,
+        ):
+            self._staged_base_loader().load_text_encoder(model, model_type, model_names, weight_dtypes, quantization)
+
+        def load_vae(
+                self,
+                model: BaseModel,
+                model_type: ModelType,
+                model_names: ModelNames,
+                weight_dtypes: ModelWeightDtypes,
+                quantization: QuantizationConfig,
+        ):
+            self._staged_base_loader().load_vae(model, model_type, model_names, weight_dtypes, quantization)
+
+        def load_transformer(
+                self,
+                model: BaseModel,
+                model_type: ModelType,
+                model_names: ModelNames,
+                weight_dtypes: ModelWeightDtypes,
+                quantization: QuantizationConfig,
+        ):
+            self._staged_base_loader().load_transformer(model, model_type, model_names, weight_dtypes, quantization)
+
+        def load_lora(
+                self,
+                model: BaseModel,
+                model_names: ModelNames,
+        ):
+            # the LoRA state dict is loaded only after the base components exist: canonicalization
+            # enumerates module names on the live transformer
+            lora_loader_class().load(model, model_names)
+
     for model_type in model_spec_map:
         factory.register(BaseModelLoader, GenericLoRAModelLoader, model_type, TrainingMethod.LORA)
     return GenericLoRAModelLoader

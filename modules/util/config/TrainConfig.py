@@ -409,6 +409,9 @@ class TrainConfig(BaseConfig):
     aspect_ratio_bucketing: bool
     latent_caching: bool
     clear_cache_before_training: bool
+    # After all text embeddings are cached, drop the frozen text encoder instead of keeping it
+    # resident on the temp device. Requires latent text caching; see BaseFlux2Setup validation.
+    release_text_encoder_after_cache: bool
 
     # training settings
     learning_rate_scheduler: LearningRateScheduler
@@ -915,7 +918,19 @@ class TrainConfig(BaseConfig):
 
     def train_any_embedding(self) -> bool:
         return ((self.training_method == TrainingMethod.EMBEDDING) and not self.embedding.is_output_embedding) \
-            or any((embedding.train and not embedding.is_output_embedding) for embedding in self.additional_embeddings)
+               or any((embedding.train and not embedding.is_output_embedding) for embedding in self.additional_embeddings)
+
+    def any_samples_enabled(self) -> bool:
+        # True if any sample is configured and enabled, reading the sample definition file if
+        # samples are not already loaded. A missing/broken sample file counts as "no samples",
+        # mirroring how training treats it.
+        if self.samples is not None:
+            return any(bool(sample.enabled) for sample in self.samples)
+        try:
+            with open(self.sample_definition_file_name, 'r') as f:
+                return any(bool(sample.get("enabled", True)) for sample in json.load(f))
+        except Exception:
+            return False
 
     def train_any_output_embedding(self) -> bool:
         return ((self.training_method == TrainingMethod.EMBEDDING) and self.embedding.is_output_embedding) \
@@ -1054,6 +1069,7 @@ class TrainConfig(BaseConfig):
         data.append(("aspect_ratio_bucketing", True, bool, False))
         data.append(("latent_caching", True, bool, False))
         data.append(("clear_cache_before_training", True, bool, False))
+        data.append(("release_text_encoder_after_cache", False, bool, False))
 
         # training settings
         data.append(("learning_rate_scheduler", LearningRateScheduler.CONSTANT, LearningRateScheduler, False))

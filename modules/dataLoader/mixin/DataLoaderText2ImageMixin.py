@@ -54,6 +54,33 @@ import torch
 from diffusers import AutoencoderKL
 
 
+class ReadinessDiskCache(DiskCache):
+    """
+    DiskCache with an extra readiness query used by the release_text_encoder_after_cache mode:
+    a weight component (text encoder, VAE) may only be freed once every group and every requested
+    variation has a finished cache (aggregate.pt), not just the variations touched by the current
+    epoch. The path/aggregate-file layout mirrors DiskCache.__get_cache_dir / __is_caching_done.
+    """
+
+    def all_variations_cached(self) -> bool:
+        if not self.variations_initialized:
+            return False
+        for group_key, variations in self.group_variations.items():
+            for in_variation in range(variations):
+                cache_dir = os.path.join(self.cache_dir, group_key, "variation-" + str(in_variation))
+                if not os.path.isfile(os.path.join(cache_dir, "aggregate.pt")):
+                    return False
+        return True
+
+
+class TextCachingDiskCache(ReadinessDiskCache):
+    """DiskCache for text embeddings; see ReadinessDiskCache."""
+
+
+class LatentCachingDiskCache(ReadinessDiskCache):
+    """DiskCache for latents; see ReadinessDiskCache."""
+
+
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
         supported_extensions = set()
@@ -320,6 +347,67 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         return modules
 
+    def _cache_names(self, config: TrainConfig):
+        # (image_split_names, image_aggregate_names, text_split_names, sort_names) for this
+        # model. Implemented by the model-specific loaders; also used to build the slim
+        # cache-warming pipelines of the staged loading mode.
+        raise NotImplementedError
+
+    def _text_preparation_modules(self, config: TrainConfig, model: BaseModel) -> list:
+        # the text-encoding part of _preparation_modules, so the text cache can be warmed
+        # without any image/VAE modules
+        raise NotImplementedError
+
+    def _image_preparation_modules(self, config: TrainConfig, model: BaseModel) -> list:
+        # the image-encoding part of _preparation_modules, so the image cache can be warmed
+        # without any text-encoder modules
+        raise NotImplementedError
+
+    def _text_cache_dir(self, config: TrainConfig) -> str:
+        text_cache_dir = os.path.join(config.cache_dir, "text")
+        # the text cache key (mgds DiskCache) only hashes prompt/concept data, not the text encoder
+        # itself - so switching the text encoder (e.g. to a quantized GGUF override) would silently
+        # reuse stale embeddings. Isolate the text cache per text encoder override.
+        te_override = config.text_encoder.model_name
+        if te_override:
+            import hashlib
+            te_tag = hashlib.sha256(te_override.encode("utf-8")).hexdigest()[:12]
+            text_cache_dir = os.path.join(text_cache_dir, f"te-{te_tag}")
+        return text_cache_dir
+
+    def _create_image_disk_cache(
+            self,
+            model: BaseModel,
+            config: TrainConfig,
+            image_split_names: list[str],
+            image_aggregate_names: list[str],
+            before_cache_image_fun: Callable[[], None] | None = None,
+    ) -> LatentCachingDiskCache:
+        if before_cache_image_fun is None:
+            def prepare_vae():
+                model.materialize_only("vae")
+                model.eval()
+            before_cache_image_fun = prepare_vae
+        return LatentCachingDiskCache(cache_dir=os.path.join(config.cache_dir, "image"), split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
+                                     balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'],
+                                     group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
+
+    def _create_text_disk_cache(
+            self,
+            model: BaseModel,
+            model_setup: ModelSetupText2ImageMixin,
+            config: TrainConfig,
+            text_split_names: list[str],
+    ) -> TextCachingDiskCache:
+        def before_cache_text_fun():
+            model_setup.prepare_text_caching(model, config)
+        return TextCachingDiskCache(cache_dir=self._text_cache_dir(config), split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
+                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+
+    def _create_variation_sorting(self, names: list[str]) -> VariationSorting:
+        return VariationSorting(names=names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
+                                variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled')
+
     def _cache_modules_from_names(
             self,
             model: BaseModel,
@@ -332,32 +420,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             text_caching: bool,
             before_cache_image_fun: Callable[[], None] | None = None,
     ):
-        image_cache_dir = os.path.join(config.cache_dir, "image")
-        text_cache_dir = os.path.join(config.cache_dir, "text")
-        # the text cache key (mgds DiskCache) only hashes prompt/concept data, not the text encoder
-        # itself - so switching the text encoder (e.g. to a quantized GGUF override) would silently
-        # reuse stale embeddings. Isolate the text cache per text encoder override.
-        te_override = config.text_encoder.model_name
-        if te_override:
-            import hashlib
-            te_tag = hashlib.sha256(te_override.encode("utf-8")).hexdigest()[:12]
-            text_cache_dir = os.path.join(text_cache_dir, f"te-{te_tag}")
-
-        if before_cache_image_fun is None:
-            def prepare_vae():
-                model.materialize_only("vae")
-                model.eval()
-            before_cache_image_fun = prepare_vae
-
-        def before_cache_text_fun():
-            model_setup.prepare_text_caching(model, config)
-
-        image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
-                                     balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'],
-                                     group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
-
-        text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+        image_disk_cache = self._create_image_disk_cache(model, config, image_split_names, image_aggregate_names, before_cache_image_fun)
+        text_disk_cache = self._create_text_disk_cache(model, model_setup, config, text_split_names)
 
         modules = []
 
@@ -372,12 +436,90 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 sort_names = [x for x in sort_names if x not in text_split_names]
 
         if len(sort_names) > 0:
-            variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                                 variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled')
-
-            modules.append(variation_sorting)
+            modules.append(self._create_variation_sorting(sort_names))
 
         return modules
+
+    def _create_text_cache_warming_dataset(
+            self,
+            config: TrainConfig,
+            model: BaseModel,
+            model_setup: ModelSetupText2ImageMixin,
+            train_progress: TrainProgress,
+            is_validation: bool,
+            aspect_bucketing_quantization: int,
+            frame_dim_enabled: bool = False,
+            vae_frame_dim: bool = False,
+            allow_video_files: bool = False,
+            supports_inpainting: bool = True,
+    ):
+        # Slim pipeline that only warms the text cache. The module order up to the text cache is
+        # identical to the training pipeline (enumeration, loading, bucketing, crop, augmentations),
+        # so the augmentation randomness seeded by module index, the cache keys, balancing and
+        # variation selection match exactly what the training pipeline would produce. The latent
+        # cache, image encoding, batch sorting and batch assembly are left out, so the VAE is
+        # never touched and no training batch is ever assembled.
+        image_split_names, image_aggregate_names, text_split_names, sort_names = self._cache_names(config)
+        text_disk_cache = self._create_text_disk_cache(model, model_setup, config, text_split_names)
+        remaining = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names and x not in text_split_names]
+
+        return self._create_mgds(
+            config,
+            [
+                self._enumerate_input_modules(config, allow_videos=allow_video_files),
+                self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim),
+                self._mask_augmentation_modules(config),
+                self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled),
+                self._crop_modules(config),
+                self._augmentation_modules(config),
+                self._inpainting_modules(config) if supports_inpainting else [],
+                self._text_preparation_modules(config, model),
+                [text_disk_cache, self._create_variation_sorting(remaining)],
+                [OutputPipelineModule(names=remaining)],
+            ],
+            train_progress,
+            is_validation,
+        )
+
+    def _create_image_cache_warming_dataset(
+            self,
+            config: TrainConfig,
+            model: BaseModel,
+            model_setup: ModelSetupText2ImageMixin,
+            train_progress: TrainProgress,
+            is_validation: bool,
+            aspect_bucketing_quantization: int,
+            frame_dim_enabled: bool = False,
+            vae_frame_dim: bool = False,
+            allow_video_files: bool = False,
+            supports_inpainting: bool = True,
+    ):
+        # Slim pipeline that only warms the image (latent) cache. Same reasoning as
+        # _create_text_cache_warming_dataset: identical module order up to the image cache so
+        # crop jitter seeds and cache keys match the training pipeline. Text encoding and the
+        # text cache are left out (the text encoder is already released), as are batch sorting
+        # and batch assembly.
+        image_split_names, image_aggregate_names, text_split_names, sort_names = self._cache_names(config)
+        image_disk_cache = self._create_image_disk_cache(model, config, image_split_names, image_aggregate_names)
+        remaining = [x for x in sort_names if x not in image_aggregate_names and x not in image_split_names and x not in text_split_names]
+
+        return self._create_mgds(
+            config,
+            [
+                self._enumerate_input_modules(config, allow_videos=allow_video_files),
+                self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim),
+                self._mask_augmentation_modules(config),
+                self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled),
+                self._crop_modules(config),
+                self._augmentation_modules(config),
+                self._inpainting_modules(config) if supports_inpainting else [],
+                self._image_preparation_modules(config, model),
+                [image_disk_cache, self._create_variation_sorting(remaining)],
+                [OutputPipelineModule(names=remaining)],
+            ],
+            train_progress,
+            is_validation,
+        )
 
 
     def _create_dataset(

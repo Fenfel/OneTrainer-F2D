@@ -244,6 +244,11 @@ class BaseTrainUIView(ABC):
                          tooltip="Clears the cache directory before starting to train. Only disable this if you want to continue using the same cached data. Disabling this can lead to errors, if other settings are changed during a restart")
         self.components.switch(frame, 2, 1, ui_state, "clear_cache_before_training")
 
+        # release text encoder after cache
+        self.components.label(frame, 3, 0, "Release text encoder after cache",
+                         tooltip="Loads the model in stages to save memory: first the text encoder, then the text cache is fully warmed and the encoder is freed; then the VAE, the image cache is warmed and the VAE is freed; only then the transformer, LoRA and optimizer are loaded. Requires latent caching, a frozen text encoder and transformer LoRA. Sampling must be disabled.")
+        self.components.switch(frame, 3, 1, ui_state, "release_text_encoder_after_cache")
+
     def build_sampling_tab_header(self, top_frame, sub_frame, controller, ui_state):
         self.components.label(top_frame, 0, 0, "Sample After",
                          tooltip="The interval used when automatically sampling from the model during training")

@@ -157,8 +157,21 @@ class TestCacheIsolation:
         from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
         from mgds.pipelineModules.DiskCache import DiskCache
 
-        modules = DataLoaderText2ImageMixin._cache_modules_from_names(
-            None,  # self is unused
+        class _Host(DataLoaderText2ImageMixin):
+            # minimal concrete subclass so the mixin's cache factories can be called normally
+            def _preparation_modules(self, config, model):
+                return []
+
+            def _cache_modules(self, config, model, model_setup):
+                return []
+
+            def _output_modules(self, config, model, model_setup):
+                return []
+
+            def _debug_modules(self, config, model):
+                return []
+
+        modules = _Host()._cache_modules_from_names(
             model=None,
             model_setup=None,
             image_split_names=["latent_image"],

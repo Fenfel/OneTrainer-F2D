@@ -26,11 +26,16 @@ class BaseDataLoader(
             model_setup: BaseModelSetup,
             train_progress: TrainProgress,
             is_validation: bool = False,
+            cache_warming_stage: str | None = None,
     ):
         super().__init__()
 
         self.train_device = train_device
         self.temp_device = temp_device
+
+        # "text"/"image": build only the slim cache-warming pipeline of the staged loading mode
+        # instead of the full training pipeline; None (default) keeps the normal behaviour.
+        self._cache_warming_stage = cache_warming_stage
 
         if is_validation:
             config = copy.copy(config)
@@ -51,6 +56,11 @@ class BaseDataLoader(
 
     def get_data_loader(self) -> TrainDataLoader:
         return self.__dl
+
+    def get_pipeline_modules(self) -> list:
+        # all pipeline modules of the dataset, in order. Used for introspection from the trainer
+        # (e.g. finding the text DiskCache to check cache readiness).
+        return self.__ds.loading_pipeline.modules
 
     @abstractmethod
     def _create_dataset(

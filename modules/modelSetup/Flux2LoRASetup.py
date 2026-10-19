@@ -30,9 +30,12 @@ class Flux2LoRASetup(
             model: Flux2Model,
             config: TrainConfig,
     ):
-        model.text_encoder.requires_grad_(False)
-        model.transformer.requires_grad_(False)
-        model.vae.requires_grad_(False)
+        if model.text_encoder is not None:
+            model.text_encoder.requires_grad_(False)
+        if model.transformer is not None:
+            model.transformer.requires_grad_(False)
+        if model.vae is not None:
+            model.vae.requires_grad_(False)
 
         self._setup_model_part_requires_grad("transformer", model.transformer_lora, config.transformer, model.train_progress)
 
@@ -73,13 +76,16 @@ class Flux2LoRASetup(
             parts.append("vae")
         model.materialize_only(*parts)
 
-        model.text_encoder.eval()
-        model.vae.eval()
+        if model.text_encoder is not None:
+            model.text_encoder.eval()
+        if model.vae is not None:
+            model.vae.eval()
 
-        if config.transformer.train:
-            model.transformer.train()
-        else:
-            model.transformer.eval()
+        if model.transformer is not None:
+            if config.transformer.train:
+                model.transformer.train()
+            else:
+                model.transformer.eval()
 
     def after_optimizer_step(
             self,
