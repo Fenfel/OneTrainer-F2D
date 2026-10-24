@@ -1,4 +1,5 @@
 from abc import ABCMeta
+from collections.abc import Callable
 from contextlib import nullcontext
 from uuid import uuid4
 
@@ -96,6 +97,11 @@ class BaseModel(metaclass=ABCMeta):
         self.embedding_state_dicts = {}
         self.autocast_context = nullcontext()
         self.train_dtype = DataType.FLOAT_32
+        # reload hooks used by the release_text_encoder_after_cache mode: part name -> callable
+        # that loads a released component on demand. _move_part invokes the hook when a component
+        # is moved onto the train_device but is currently None, so samplers and cache stages that
+        # call materialize_only() transparently trigger the reload without knowing about the mode.
+        self.component_reload_hooks: dict[str, Callable[[], None]] = {}
 
     @property
     def train_device(self) -> torch.device:
@@ -137,18 +143,30 @@ class BaseModel(metaclass=ABCMeta):
         stem = f"{part}_1" if hasattr(self, f"{part}_1") else part
 
         conductor = getattr(self, f"{stem}_offload_conductor", None)
+        component = None if conductor is not None else getattr(self, stem)  # raises if `part` doesn't name a real attribute
+
+        # A released component (release_text_encoder_after_cache) is None; if a reload hook is
+        # registered for this part, load it on demand before moving it. The hook only runs when
+        # moving onto the train_device (what materialize()/materialize_only() do); evicting a
+        # component that isn't loaded is a no-op. The hook may also (re-)create the part's
+        # offload conductor, so the conductor branch is re-checked after it ran.
+        if component is None and conductor is None and device_equals(device, self.train_device):
+            hook = self.component_reload_hooks.get(part)
+            if hook is not None:
+                hook()
+                conductor = getattr(self, f"{stem}_offload_conductor", None)
+                component = None if conductor is not None else getattr(self, stem)
+
         if conductor is not None:
             if device_equals(device, self.temp_device):
                 conductor.evict()
             else:
                 assert device_equals(device, self.train_device), f"unexpected device {device} for part {part}"
                 conductor.materialize()
-        else:
-            component = getattr(self, stem)  # raises if `part` doesn't name a real attribute
+        elif component is not None:
             # None when the part is excluded from training (e.g. a text encoder with include_text_encoder off):
             # it stays in model_parts() but the loader never populated it, so there is nothing to move.
-            if component is not None:
-                component.to(device=device)
+            component.to(device=device)
 
         lora = getattr(self, f"{stem}_lora", None)
         if lora is not None:

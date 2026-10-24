@@ -624,6 +624,23 @@ class LayerOffloadConductor:
     def offload_activated(self) -> bool:
         return self.__offload_activations or self.__offload_layers
 
+    def release(self):
+        # Final teardown used by release_text_encoder_after_cache before the conductor is dropped.
+        # Every static cache buffer must go through deallocate_cache(), which runs
+        # cudaHostUnregister on the pinned CPU buffers: dropping the conductor without this
+        # frees the tensors but leaves their pages registered with the CUDA driver, so the RAM
+        # is never returned to the OS (the release reports "garbage collected" while memory
+        # stays flat) and a later allocation landing on the same address range fails
+        # cudaHostRegister with cudaErrorHostMemoryAlreadyRegistered (712).
+        self.__wait_all_layer_transfers()
+        self.__wait_all_activation_transfers()
+
+        self.__train_device_layer_allocator.deallocate_cache()
+        self.__temp_device_layer_allocator.deallocate_cache()
+        self.__temp_device_activations_allocator.deallocate_cache()
+
+        self.__is_active = False
+
     def evict(self):
         torch_gc()
 

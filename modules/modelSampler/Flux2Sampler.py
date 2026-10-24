@@ -35,6 +35,12 @@ class Flux2Sampler(BaseModelSampler):
         self.model = model
         self.model_type = model_type
         self.pipeline = model.create_pipeline()
+        # conditioning for fixed sample prompts lives on the model (sample_conditioning_cache):
+        # in staged loading mode (release_text_encoder_after_cache) the trainer warms it during
+        # the text-cache stage, so a scheduled sample prompt is a cache hit and needs no text
+        # encoder at all after the release. Only an unknown prompt (a manual custom sample)
+        # triggers the on-demand text encoder reload.
+        self._conditioning_cache = model.sample_conditioning_cache
 
     @torch.no_grad()
     def __sample_base(
@@ -61,21 +67,32 @@ class Flux2Sampler(BaseModelSampler):
             noise_scheduler = copy.deepcopy(self.model.noise_scheduler)
             image_processor = self.pipeline.image_processor
             transformer = self.pipeline.transformer
-            vae = self.pipeline.vae
 
             vae_scale_factor = 8
             num_latent_channels = 32
             patch_size = 2
 
-            # prepare prompt
-            self.model.materialize_only("text_encoder")
-
+            # prepare prompt. Fixed prompts are cached (see _conditioning_cache): a repeated
+            # sample prompt needs no text encoder, so in staged loading mode the on-demand TE
+            # reload is skipped for it entirely.
             batch_size = 2 if cfg_scale > 1.0 and not transformer.config.guidance_embeds else 1
-            prompt_embedding = self.model.encode_text(
-                text=[prompt, negative_prompt] if batch_size == 2 else prompt,
-                train_device=self.train_device,
-                text_encoder_sequence_length=text_encoder_sequence_length,
+            cache_key = (
+                prompt, negative_prompt if batch_size == 2 else None,
+                text_encoder_sequence_length, batch_size,
             )
+            prompt_embedding = self._conditioning_cache.get(cache_key)
+            if prompt_embedding is None:
+                self.model.materialize_only("text_encoder")
+
+                prompt_embedding = self.model.encode_text(
+                    text=[prompt, negative_prompt] if batch_size == 2 else prompt,
+                    train_device=self.train_device,
+                    text_encoder_sequence_length=text_encoder_sequence_length,
+                )
+                self._conditioning_cache[cache_key] = prompt_embedding
+            # warmed entries are persisted on CPU (sample_conditioning_cache file); the transformer
+            # needs them on the train device. For in-run hits this .to() is a no-op.
+            prompt_embedding = prompt_embedding.to(self.train_device)
 
             # prepare latent image
             latent_image = torch.randn(
@@ -141,7 +158,10 @@ class Flux2Sampler(BaseModelSampler):
             latents = self.model.unscale_latents(latent_image)
             latents = self.model.unpatchify_latents(latents)
 
-            image = vae.decode(latents, return_dict=False)[0]
+            # decode with the model's current VAE, not the pipeline reference captured at sampler
+            # construction: in staged loading mode the VAE may have been released and reloaded
+            # (the reload hook replaces model.vae, not the old pipeline attribute)
+            image = self.model.vae.decode(latents, return_dict=False)[0]
 
             image = image_processor.postprocess(image, output_type='pil')
 

@@ -16,6 +16,7 @@ from modules.util.checkpointing_util import (
     enable_checkpointing_for_qwen3_encoder_layers,
 )
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.component_lifecycle import ComponentNotLoadedError
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.TrainProgress import TrainProgress
 
@@ -66,12 +67,9 @@ class BaseFlux2Setup(
                 "'Release text encoder after cache' requires a frozen text encoder. "
                 "Disable 'Train Text Encoder'."
             )
-        if config.any_samples_enabled():
-            raise ValueError(
-                "'Release text encoder after cache' cannot be used with enabled samples: sampling encodes "
-                "its prompts with the text encoder, which is freed after caching. Disable the samples "
-                "(or the 'Sample' entries in the Sampling tab) to use this mode."
-            )
+        # Samples are supported: with the staged loading mode the text encoder / VAE are reloaded
+        # on demand for the sampling phases that need them and released again afterwards
+        # (see GenericTrainer.__set_staged_component_hooks).
 
     def setup_optimizations(
             self,
@@ -204,17 +202,13 @@ class BaseFlux2Setup(
         ).mean()
 
     def prepare_text_caching(self, model: FluxModel, config: TrainConfig):
+        # materialize_only first: in the staged loading mode (release_text_encoder_after_cache) the
+        # model has a reload hook that loads the text encoder on demand when the text cache turns
+        # out to be incomplete, so a not-yet-loaded encoder is not an error here.
+        model.materialize_only("text_encoder")
         if model.text_encoder is None:
-            if getattr(model, "text_encoder_released", False):
-                raise RuntimeError(
-                    "Text caching is needed but the text encoder was already released "
-                    "(release_text_encoder_after_cache). The text cache became incomplete or was invalidated "
-                    "during this run. Restart the training so the cache can be rebuilt, or disable "
-                    "release_text_encoder_after_cache."
-                )
-            raise RuntimeError(
+            raise ComponentNotLoadedError(
                 "Text caching is needed but no text encoder is loaded. "
                 "Enable 'Include Text Encoder' or disable text caching."
             )
-        model.materialize_only("text_encoder")
         model.eval()

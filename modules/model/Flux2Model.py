@@ -81,6 +81,13 @@ class Flux2Model(BaseModel):
         self.transformer_lora = None
         self.lora_state_dict = None
 
+        # conditioning for fixed sample prompts, keyed exactly like Flux2Sampler does:
+        # (prompt, negative_prompt or None, sequence_length, batch_size) -> embedding on CPU.
+        # In release_text_encoder_after_cache mode the trainer warms this during the text-cache
+        # stage (together with the rest of the caching) and persists it under cache_dir, so the
+        # text encoder is never loaded again for samples after its release.
+        self.sample_conditioning_cache: dict[tuple, torch.Tensor] = {}
+
     def fusion_groups(self) -> list | None:
         # Only the two double-block qkv groups -- Flux2's single block is the already-fused attn.to_qkv_mlp_proj.
         # NOTE: the fused suffix (attn.qkv / attn.added_qkv) is OneTrainer's name for the fused module on the
@@ -318,6 +325,69 @@ class Flux2Model(BaseModel):
         self.vae_bn_running_mean = self.vae.bn.running_mean.detach().cpu().clone()
         self.vae_bn_running_var = self.vae.bn.running_var.detach().cpu().clone()
         self.vae_batch_norm_eps = float(self.vae.config.batch_norm_eps)
+
+    def load_vae_bn_stats_from_disk(self, base_model_name: str, vae_model_name: str | None = None) -> None:
+        # The training step scales cached latents with the VAE batch-norm stats. When the VAE was
+        # never loaded at all (fully valid latent cache in staged loading mode), read just those
+        # stats - two tiny tensors and one config value - straight from the VAE files instead of
+        # loading the VAE weights. Mirrors the path logic of Flux2ModelLoader.__load_vae.
+        import json
+        import os
+
+        from safetensors import safe_open
+
+        # vae_dir is usually a local directory, but the model name may also be an HF hub id, in
+        # which case the files are fetched from the (already populated) HF cache via subfolder,
+        # mirroring how the model loader itself resolves components.
+        if vae_model_name:
+            repo_id = None if os.path.isdir(vae_model_name) else vae_model_name
+            local_dir = None if repo_id else vae_model_name
+            subfolder = "" if repo_id else ""
+        else:
+            candidate = os.path.join(base_model_name, "vae")
+            if os.path.isdir(candidate):
+                repo_id, local_dir = None, candidate
+            else:
+                repo_id, local_dir = base_model_name, None
+            subfolder = "vae"
+
+        def resolve(name: str) -> str:
+            if local_dir is not None:
+                return os.path.join(local_dir, name)
+            from huggingface_hub import hf_hub_download
+            return hf_hub_download(repo_id, f"{subfolder}/{name}" if subfolder else name)
+
+        with open(resolve("config.json"), "r") as config_file:
+            config = json.load(config_file)
+        self.vae_batch_norm_eps = float(config["batch_norm_eps"])
+
+        single_file = "diffusion_pytorch_model.safetensors"
+        index_file = "diffusion_pytorch_model.safetensors.index.json"
+        try:
+            files = [resolve(single_file)]
+        except Exception:
+            # sharded VAE weights: only the shards holding the bn.* tensors are needed
+            with open(resolve(index_file), "r") as index_handle:
+                index = json.load(index_handle)
+            files = sorted({resolve(shard) for key, shard in index["weight_map"].items()
+                            if key.startswith("bn.")})
+
+        stats = {}
+        for file in files:
+            with safe_open(file, framework="pt") as handle:
+                for key in ("bn.running_mean", "bn.running_var"):
+                    if key in handle.keys():
+                        stats[key] = handle.get_tensor(key)
+
+        if "bn.running_mean" not in stats or "bn.running_var" not in stats:
+            raise RuntimeError(
+                f"Cannot read the VAE batch-norm stats from {vae_model_name or base_model_name}: "
+                "bn.running_mean/bn.running_var are missing from the VAE weights. Disable "
+                "release_text_encoder_after_cache or check the model directory."
+            )
+
+        self.vae_bn_running_mean = stats["bn.running_mean"].detach().cpu().clone()
+        self.vae_bn_running_var = stats["bn.running_var"].detach().cpu().clone()
 
     def _vae_bn_stats(self) -> tuple[Tensor, Tensor, float]:
         if self.vae is not None:

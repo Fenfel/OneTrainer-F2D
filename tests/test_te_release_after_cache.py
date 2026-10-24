@@ -92,14 +92,15 @@ class TestPreLoadValidation:
         with pytest.raises(ValueError, match="frozen text encoder"):
             _flux2_lora_setup().validate_pre_load(config)
 
-    def test_rejects_enabled_samples(self):
+    def test_enabled_samples_are_allowed(self):
+        # samples work with staged loading: the text encoder / VAE are reloaded on demand for
+        # the sampling phases and released again afterwards
         config = _flux2_lora_config()
         # samples list with one enabled entry: a minimal object with .enabled is enough
         class _S:
             enabled = True
         config.samples = [_S()]
-        with pytest.raises(ValueError, match="samples"):
-            _flux2_lora_setup().validate_pre_load(config)
+        _flux2_lora_setup().validate_pre_load(config)
 
     def test_non_flux2_setup_rejects_flag(self):
         # BaseModelSetup base implementation rejects the flag for all non-Flux.2 setups
@@ -191,10 +192,17 @@ class TestReleaseCollectsEncoder:
             def get_pipeline_modules(self):
                 return []
 
+        class _Conductor:
+            def __init__(self):
+                self.released = False
+
+            def release(self):
+                self.released = True
+
         trainer = object.__new__(GenericTrainer)
         model = _Model()
         model.text_encoder = encoder
-        model.text_encoder_offload_conductor = object()
+        model.text_encoder_offload_conductor = _Conductor()
         trainer.model = model
         trainer.data_loader = _Loader()
         trainer.model_sampler = None
@@ -215,10 +223,15 @@ class TestReleaseCollectsEncoder:
 
         trainer, model, encoder_ref = create()
 
+        conductor = model.text_encoder_offload_conductor
         trainer._GenericTrainer__release_text_encoder()
 
         assert model.text_encoder is None
         assert model.text_encoder_released is True
+        # the conductor's pinned cache buffers must be unregistered before it is dropped,
+        # otherwise the RAM stays pinned and the next cudaHostRegister fails with error 712
+        assert conductor.released is True
+        assert model.text_encoder_offload_conductor is None
         assert encoder_ref() is None, "TE must be collectable while the release frame is still running"
         out = capsys.readouterr().out
         assert "Text encoder was garbage collected." in out

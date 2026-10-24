@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import os
@@ -177,12 +178,16 @@ class GenericTrainer(BaseTrainer):
             )
 
     def __init_staged(self, model_names):
-        # Staged loading for release_text_encoder_after_cache: components are loaded one at a time,
-        # each followed by its cache stage, so that only one heavy component is resident at once:
-        #   metadata -> text encoder -> warm text cache -> release TE
-        #   -> VAE -> warm image cache -> release VAE -> transformer -> LoRA/optimizer/sampler.
-        # The point is that the transformer (the largest component) is loaded only after the TE and
-        # VAE weights were freed, so a big/quantized DiT fits where loading everything at once OOMs.
+        # Staged loading for release_text_encoder_after_cache. Components are loaded one at a
+        # time, each followed by its cache stage, so that only one heavy component is resident
+        # at once. The cache stages run as a probe with the component NOT loaded: a fully valid
+        # cache never touches the text encoder / VAE, so with a warm cache they are never loaded
+        # at all. If a cache turns out to be incomplete, the pipeline's before_cache_fun calls
+        # materialize_only(), which invokes the component's reload hook (see
+        # BaseModel._move_part) and the component is loaded on demand, used, and released again.
+        # After both caches are done: transformer -> LoRA/optimizer/sampler. The point is that
+        # the transformer (the largest component) is loaded only after the TE and VAE weights
+        # were freed, so a big/quantized DiT fits where loading everything at once OOMs.
         model_type = self.config.model_type
         weight_dtypes = self.config.weight_dtypes()
         quantization = self.config.quantization
@@ -199,49 +204,65 @@ class GenericTrainer(BaseTrainer):
         # sets train_dtype/autocast; per-part optimizations are applied once per loaded part
         self.model_setup.setup_optimizations(self.model, self.config)
 
-        # --- stage 1: text encoder + text cache ---
-        self.__stage_marker("text encoder load: before")
-        self.callbacks.on_update_status("staged loading: text encoder")
-        self.model_loader.load_text_encoder(self.model, model_type, model_names, weight_dtypes, quantization)
-        self.model_setup.setup_optimizations(self.model, self.config)
-        self.model_setup.setup_train_device(self.model, self.config)
-        self.__stage_marker("text encoder load: after")
+        # reload hooks must exist before the first cache stage: they are what loads the TE/VAE
+        # on demand when a cache probe finds missing entries
+        self.__set_staged_component_hooks(model_names)
 
+        # --- stage 1: text cache (text encoder loaded only if the cache is incomplete) ---
         self.callbacks.on_update_status("staged loading: warming the text cache")
+        self.__stage_marker("text cache warming: before")
         self.__create_warming_loaders("text")
         self.__warm_cache_until_ready(self.__text_cache_ready, "text cache")
         self.__drop_warming_loaders()
+        self.__stage_marker("text cache warming: after")
 
-        self.__stage_marker("text encoder release: before")
-        if not self.__release_text_encoder():
-            raise RuntimeError(
-                "Staged loading stopped: the text encoder was still referenced after release, so its "
-                "memory was not freed and loading the next component would risk the same OOM. Report "
-                "this with the list of enabled options."
-            )
-        self.__stage_marker("text encoder release: after")
+        # Fixed sample prompts are encoded here - together with the rest of the caching, while
+        # the text encoder is resident - and persisted under cache_dir, so after the release no
+        # sample ever loads the text encoder again. Only an unknown prompt (a manual custom
+        # sample) can still trigger the on-demand reload.
+        if self.config.any_samples_enabled():
+            self.__stage_marker("sample conditioning warmup: before")
+            self.__warm_sample_conditioning(model_names)
+            self.__stage_marker("sample conditioning warmup: after")
 
-        # --- stage 2: VAE + image cache ---
-        self.__stage_marker("VAE load: before")
-        self.callbacks.on_update_status("staged loading: VAE")
-        self.model_loader.load_vae(self.model, model_type, model_names, weight_dtypes, quantization)
-        self.model_setup.setup_optimizations(self.model, self.config)
-        self.model_setup.setup_train_device(self.model, self.config)
-        self.__stage_marker("VAE load: after")
+        if self.model.text_encoder is not None:
+            self.__stage_marker("text encoder release: before")
+            if not self.__release_text_encoder():
+                raise RuntimeError(
+                    "Staged loading stopped: the text encoder was still referenced after release, so its "
+                    "memory was not freed and loading the next component would risk the same OOM. Report "
+                    "this with the list of enabled options."
+                )
+            self.__stage_marker("text encoder release: after")
+        else:
+            print("Text cache is fully valid: the text encoder was never loaded.")
+            self.model.text_encoder_released = True
 
+        # --- stage 2: image cache (VAE loaded only if the cache is incomplete) ---
         self.callbacks.on_update_status("staged loading: warming the image cache")
+        self.__stage_marker("image cache warming: before")
         self.__create_warming_loaders("image")
         self.__warm_cache_until_ready(self.__image_cache_ready, "image (latent) cache")
         self.__drop_warming_loaders()
+        self.__stage_marker("image cache warming: after")
 
-        self.__stage_marker("VAE release: before")
-        if not self.__release_vae():
-            raise RuntimeError(
-                "Staged loading stopped: the VAE was still referenced after release, so its memory "
-                "was not freed and loading the transformer would risk the same OOM. Report this with "
-                "the list of enabled options."
+        if self.model.vae is not None:
+            self.__stage_marker("VAE release: before")
+            if not self.__release_vae():
+                raise RuntimeError(
+                    "Staged loading stopped: the VAE was still referenced after release, so its memory "
+                    "was not freed and loading the transformer would risk the same OOM. Report this with "
+                    "the list of enabled options."
+                )
+            self.__stage_marker("VAE release: after")
+        else:
+            print("Image (latent) cache is fully valid: the VAE was never loaded.")
+            self.model.vae_released = True
+            # the training step still scales cached latents -> the VAE batch-norm stats are needed
+            # even though the VAE itself never was; read them straight from the VAE files
+            self.model.load_vae_bn_stats_from_disk(
+                model_names.base_model, model_names.vae_model or None,
             )
-        self.__stage_marker("VAE release: after")
 
         # --- stage 3: transformer + LoRA/optimizer ---
         self.__stage_marker("transformer load: before")
@@ -278,6 +299,165 @@ class GenericTrainer(BaseTrainer):
 
     def __stage_marker(self, label: str):
         print(f"[staged loading] {label}: {self.__memory_snapshot()}")
+
+    def __sample_conditioning_cache_path(self) -> str:
+        return os.path.join(self.config.cache_dir, "sample_conditioning.pt")
+
+    def __sample_conditioning_fingerprint(self, model_names) -> str:
+        # identifies everything the cached prompt embeddings depend on except the prompt itself:
+        # a different text encoder / dtype / model type invalidates the whole file
+        sha = hashlib.sha256()
+        for part in (
+            str(self.config.model_type),
+            str(model_names.base_model),
+            str(model_names.text_encoder_model),
+            str(self.config.weight_dtypes().text_encoder),
+            str(self.config.text_encoder_sequence_length),
+            # part of the cache key (batch_size depends on it); included so files written
+            # before the guidance_embeds key-default fix are invalidated and re-encoded
+            str(bool((self.model.transformer_config or {}).get("guidance_embeds", True))),
+        ):
+            sha.update(part.encode("utf-8"))
+        return sha.hexdigest()
+
+    def __sample_conditioning_key(self, sample_config: SampleConfig) -> tuple:
+        # must mirror Flux2Sampler.__sample_base exactly: batch_size 2 only when cfg_scale > 1.0
+        # and the transformer has no guidance embeddings; the transformer is not loaded during
+        # the warmup, so the flag is read from the metadata captured by load_metadata. The
+        # default must match Flux2Transformer2DModel.__init__ (True): the shipped FLUX.2-dev
+        # config.json has no guidance_embeds key at all, so defaulting to False here keyed the
+        # warmup entries (prompt, negative, seq, 2) differently from the sampler's lookup
+        # (prompt, None, seq, 1) -> guaranteed cache miss and a text encoder reload per sample.
+        guidance_embeds = bool((self.model.transformer_config or {}).get("guidance_embeds", True))
+        batch_size = 2 if (sample_config.cfg_scale or 0.0) > 1.0 and not guidance_embeds else 1
+        return (
+            sample_config.prompt,
+            sample_config.negative_prompt if batch_size == 2 else None,
+            sample_config.text_encoder_1_sequence_length,
+            batch_size,
+        )
+
+    def __get_enabled_sample_configs(self) -> list[SampleConfig]:
+        # same sources and same failure tolerance as __sample_during_training
+        if self.config.samples is not None:
+            return [s for s in self.config.samples if s.enabled]
+        try:
+            with open(self.config.sample_definition_file_name, "r") as f:
+                samples = json.load(f)
+            return [
+                SampleConfig.default_values(self.config.model_type).from_dict(s)
+                for s in samples if s.get("enabled", True)
+            ]
+        except Exception:
+            traceback.print_exc()
+            return []
+
+    def __warm_sample_conditioning(self, model_names):
+        # Encode every enabled fixed sample prompt while the text encoder is resident (together
+        # with the rest of the caching, before its release) and persist the embeddings under
+        # cache_dir keyed exactly like the sampler's conditioning cache. Scheduled samples then
+        # never load the text encoder after the release; only an unknown prompt (a manual custom
+        # sample) can still trigger the on-demand reload.
+        cache_path = self.__sample_conditioning_cache_path()
+        fingerprint = self.__sample_conditioning_fingerprint(model_names)
+
+        persisted: dict = {}
+        if os.path.isfile(cache_path):
+            try:
+                loaded = torch.load(cache_path, weights_only=True)
+                if isinstance(loaded, dict) and loaded.get("fingerprint") == fingerprint:
+                    persisted = {k: v for k, v in loaded.get("entries", {}).items() if isinstance(v, torch.Tensor)}
+                else:
+                    print("Sample conditioning cache was created with a different text encoder/config; re-encoding.")
+            except Exception:
+                traceback.print_exc()
+                print("Could not load the sample conditioning cache; re-encoding the sample prompts.")
+
+        # update in place: the sampler binds this dict at construction, rebinding the attribute
+        # would leave the sampler looking at the old (empty) dict
+        self.model.sample_conditioning_cache.clear()
+        self.model.sample_conditioning_cache.update(persisted)
+
+        missing: list[tuple[tuple, SampleConfig]] = []
+        for sample_config in self.__get_enabled_sample_configs():
+            # __sample_loop applies from_train_config before sampling; the warmup must key the
+            # same way so the sampler finds the entry
+            sample_config = copy.copy(sample_config)
+            sample_config.from_train_config(self.config)
+            key = self.__sample_conditioning_key(sample_config)
+            if key not in self.model.sample_conditioning_cache:
+                missing.append((key, sample_config))
+
+        if not missing:
+            print("Sample conditioning is fully cached: the text encoder will not be loaded for samples.")
+            return
+
+        # the text encoder must be resident to encode the missing prompts; if the text cache was
+        # fully valid it was never loaded, so this is its only load in the whole run
+        self.model.materialize_only("text_encoder")
+        self.callbacks.on_update_status("staged loading: encoding the sample prompts")
+        with torch.no_grad(), self.model.autocast_context:
+            for key, _sample_config in missing:
+                prompt, negative_prompt, sequence_length, batch_size = key
+                embedding = self.model.encode_text(
+                    text=[prompt, negative_prompt] if batch_size == 2 else prompt,
+                    train_device=self.train_device,
+                    text_encoder_sequence_length=sequence_length,
+                )
+                self.model.sample_conditioning_cache[key] = embedding.detach().to("cpu")
+
+        os.makedirs(self.config.cache_dir, exist_ok=True)
+        tmp_path = cache_path + ".tmp"
+        torch.save({"fingerprint": fingerprint, "entries": self.model.sample_conditioning_cache}, tmp_path)
+        os.replace(tmp_path, cache_path)
+        print(f"Sample conditioning cached for {len(self.model.sample_conditioning_cache)} prompt(s) at {cache_path}")
+
+    def __set_staged_component_hooks(self, model_names):
+        # Register on-demand reload hooks for the text encoder / VAE on the model. Whenever a
+        # cache stage or the sampler calls materialize_only("text_encoder"/"vae") while the
+        # component is None (released or never loaded), BaseModel._move_part invokes the hook,
+        # so callers do not need to know about staged loading.
+        model_type = self.config.model_type
+        weight_dtypes = self.config.weight_dtypes()
+        quantization = self.config.quantization
+
+        def reload_text_encoder():
+            self.__stage_marker("text encoder reload: before")
+            self.callbacks.on_update_status("staged loading: loading the text encoder on demand")
+            self.model_loader.load_text_encoder(self.model, model_type, model_names, weight_dtypes, quantization)
+            # re-apply the per-part optimizations (quantization/GGUF, layer offload conductor,
+            # autocast) to the freshly loaded encoder: optimized_parts still lists the part from
+            # the first pass, so drop it to let _setup_model_part run again
+            self.model_setup.optimized_parts.discard("text_encoder")
+            self.model_setup.setup_optimizations(self.model, self.config)
+            self.model.text_encoder_released = False
+            self.__rewire_pipeline_text_encoder()
+            self.__stage_marker("text encoder reload: after")
+
+        def reload_vae():
+            self.__stage_marker("VAE reload: before")
+            self.callbacks.on_update_status("staged loading: loading the VAE on demand")
+            self.model_loader.load_vae(self.model, model_type, model_names, weight_dtypes, quantization)
+            self.model_setup.optimized_parts.discard("vae")
+            self.model_setup.setup_optimizations(self.model, self.config)
+            self.model.vae_released = False
+            self.__rewire_pipeline_vae()
+            self.__stage_marker("VAE reload: after")
+
+        self.model.component_reload_hooks["text_encoder"] = reload_text_encoder
+        self.model.component_reload_hooks["vae"] = reload_vae
+
+    def __rewire_pipeline_text_encoder(self):
+        # live mgds pipelines captured the old (released) encoder reference at construction;
+        # point them at the freshly loaded one
+        for module in self.__iter_pipeline_modules():
+            if isinstance(module, (EncodeMistralText, EncodeQwenText)):
+                module.text_encoder = self.model.text_encoder
+
+    def __rewire_pipeline_vae(self):
+        for module in self.__iter_pipeline_modules():
+            if isinstance(module, (EncodeVAE, DecodeVAE, RandomLatentMaskRemove)):
+                module.vae = self.model.vae
 
     def __create_warming_loaders(self, stage: str):
         # Slim pipelines that only warm one cache (see DataLoaderText2ImageMixin): the text stage
@@ -408,6 +588,11 @@ class GenericTrainer(BaseTrainer):
         # Drop every owner of a reference to the text encoder. The conductor owns the encoder's
         # layers and its allocator caches; the mgds encode modules hold the module directly; the
         # sampler's diffusers pipeline was created at startup and captured the encoder as well.
+        # release() unregisters the conductor's pinned CPU cache buffers first - dropping the
+        # conductor alone keeps those pages pinned (memory stays flat) and poisons the address
+        # range for the next cudaHostRegister (error 712).
+        if model.text_encoder_offload_conductor is not None:
+            model.text_encoder_offload_conductor.release()
         model.text_encoder_offload_conductor = None
 
         # the warming pipelines were already dropped, so usually nothing here is left; iterate
@@ -489,7 +674,7 @@ class GenericTrainer(BaseTrainer):
         self.sample_queue.append(fun)
 
     def __execute_sample_during_training(self):
-        with PeakMemoryRecorder("sampling", enabled=False):
+        with PeakMemoryRecorder("sampling", enabled=True):
             for fun in self.sample_queue:
                 fun()
         self.sample_queue = []
@@ -621,6 +806,16 @@ class GenericTrainer(BaseTrainer):
                 ema_applied = False,
             )
 
+        if self.config.release_text_encoder_after_cache:
+            # sampling reloaded the text encoder / VAE on demand (see the reload hooks); free
+            # them again so training resumes at the same memory baseline as before the sample.
+            # This runs even when a sample raised: __sample_loop swallows sample errors, so any
+            # component that got loaded is released here.
+            if self.model.text_encoder is not None:
+                self.__release_text_encoder()
+            if self.model.vae is not None:
+                self.__release_vae()
+
         self.model_setup.setup_train_device(self.model, self.config)
         # Special case for schedule-free optimizers.
         if self.config.optimizer.optimizer.is_schedule_free:
@@ -701,6 +896,19 @@ class GenericTrainer(BaseTrainer):
                                             total_average_loss,
                                             train_progress.global_step)
 
+    def __evict_model_for_backup_or_save(self) -> bool:
+        # Returns True if the model was evicted and must be re-materialized afterwards.
+        # A LoRA backup/save serializes only the LoRA state dict plus optimizer/EMA state - never
+        # the base weights - so evicting the transformer is pure overhead here: the layer-offload
+        # conductor clones every weight onto the temp device and setup_train_device moves
+        # everything back, transiently doubling the model's resident bytes (multi-GB spike per
+        # backup). Fine-tune/embedding saves DO write the base model, so they still evict to
+        # free the train device for the CPU copy.
+        if self.config.training_method == TrainingMethod.LORA:
+            return False
+        self.model.evict()
+        return True
+
     def __save_backup_config(self, backup_path):
         config_path = os.path.join(backup_path, "onetrainer_config")
         args_path = path_util.canonical_join(config_path, "args.json")
@@ -733,15 +941,18 @@ class GenericTrainer(BaseTrainer):
             if print_msg:
                 tqdm.write("Creating Backup " + backup_path)
 
-            self.model_saver.save(
-                self.model,
-                self.config.model_type,
-                ModelFormat.INTERNAL,
-                backup_path,
-                None,
-            )
+            # peak RAM/VRAM during the backup itself: the OS only tracks a peak for the total
+            # working set, so PeakMemoryRecorder polls private RAM while the save runs
+            with PeakMemoryRecorder("backup", enabled=True):
+                self.model_saver.save(
+                    self.model,
+                    self.config.model_type,
+                    ModelFormat.INTERNAL,
+                    backup_path,
+                    None,
+                )
 
-            self.__save_backup_config(backup_path)
+                self.__save_backup_config(backup_path)
         except Exception:
             traceback.print_exc()
             tqdm.write("Could not save backup. Check your disk space!")
@@ -784,13 +995,14 @@ class GenericTrainer(BaseTrainer):
             if self.config.optimizer.optimizer.is_schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.eval()
-            self.model_saver.save(
-                model=self.model,
-                model_type=self.config.model_type,
-                output_model_format=self.config.output_model_format,
-                output_model_destination=save_path,
-                dtype=self.config.output_dtype.torch_dtype()
-            )
+            with PeakMemoryRecorder("save", enabled=True):
+                self.model_saver.save(
+                    model=self.model,
+                    model_type=self.config.model_type,
+                    output_model_format=self.config.output_model_format,
+                    output_model_destination=save_path,
+                    dtype=self.config.output_dtype.torch_dtype()
+                )
             if self.config.optimizer.optimizer.is_schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.train()
@@ -929,6 +1141,11 @@ class GenericTrainer(BaseTrainer):
                 return
             self.callbacks.on_update_status("Starting epoch/caching")
 
+            # memory label at every epoch transition: the caching that runs below and the first
+            # step of the new epoch are what a growing-memory regression shows up against
+            if self.config.release_text_encoder_after_cache:
+                self.__stage_marker(f"epoch {train_progress.epoch}: start")
+
             #call start_next_epoch with only one process at first, because it might write to the cache. All subsequent processes can read in parallel:
             for _ in multi.master_first():
                 if self.config.latent_caching:
@@ -942,6 +1159,11 @@ class GenericTrainer(BaseTrainer):
                     and not getattr(self.model, "text_encoder_released", False) \
                     and self.__text_cache_ready():
                 self.__release_text_encoder()
+
+            if self.config.release_text_encoder_after_cache \
+                    and not getattr(self.model, "vae_released", False) \
+                    and self.__image_cache_ready():
+                self.__release_vae()
 
             if self.config.debug_mode:
                 multi.warn_parameter_divergence(self.parameters, train_device)
@@ -1010,14 +1232,21 @@ class GenericTrainer(BaseTrainer):
                     backup = self.commands.get_and_reset_backup_command()
                     save = self.commands.get_and_reset_save_command()
                     if multi.is_master() and (backup or save):
-                        self.model.evict()
+                        evicted = self.__evict_model_for_backup_or_save()
                         if backup:
                             self.__backup(train_progress, True)
                         if save:
                             self.__save(train_progress, True)
-                        self.model_setup.setup_train_device(self.model, self.config)
+                        if evicted:
+                            self.model_setup.setup_train_device(self.model, self.config)
 
                 self.callbacks.on_update_status("Training ...")
+
+                first_step = not self.one_step_trained
+                if first_step:
+                    # memory label for the first training step: everything before it (loading,
+                    # caching, release) is already marked; this anchors the training baseline
+                    self.__stage_marker("first training step: before")
 
                 with (
                     TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}-{get_string_timestamp()}.pickle"),
@@ -1118,6 +1347,9 @@ class GenericTrainer(BaseTrainer):
 
                         self.one_step_trained = True
 
+                if first_step:
+                    self.__stage_marker("first training step: after")
+
                 if self.config.validation and multi.is_master():
                     self.__validate(train_progress)
 
@@ -1135,7 +1367,11 @@ class GenericTrainer(BaseTrainer):
 
     def end(self):
         if self.one_step_trained:
-            self.model.evict()
+            # same rule as during training: a LoRA backup/save never serializes the base weights,
+            # so evicting the transformer here would only add the conductor's clone storm
+            # (transiently +1x the model bytes) before the final backup/save. The model is
+            # evicted for cleanup at the end of this method regardless.
+            self.__evict_model_for_backup_or_save()
 
             if self.config.backup_before_save and multi.is_master():
                 self.__backup(self.model.train_progress)

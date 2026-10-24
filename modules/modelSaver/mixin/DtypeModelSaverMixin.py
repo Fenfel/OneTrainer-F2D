@@ -75,8 +75,12 @@ class DtypeModelSaverMixin:
 
         ordered_state_dict = OrderedDict(sorted(state_dict.items()))
         for tensor in ordered_state_dict.values():
-            data = tensor.contiguous().cpu().flatten().view(torch.uint8).numpy().tobytes()
-            sha256_hash.update(data)
+            # hash in chunks over a zero-copy uint8 view: tobytes() would materialize a full
+            # copy of every tensor (the whole LoRA at once for a single big tensor), which is
+            # pure temporary RAM during every save/backup
+            flat = tensor.detach().contiguous().cpu().flatten().view(torch.uint8).numpy()
+            for start in range(0, flat.size, 1 << 20):
+                sha256_hash.update(memoryview(flat[start:start + (1 << 20)]))
 
         return f"0x{sha256_hash.hexdigest()}"
 

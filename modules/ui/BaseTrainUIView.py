@@ -246,7 +246,7 @@ class BaseTrainUIView(ABC):
 
         # release text encoder after cache
         self.components.label(frame, 3, 0, "Release text encoder after cache",
-                         tooltip="Loads the model in stages to save memory: first the text encoder, then the text cache is fully warmed and the encoder is freed; then the VAE, the image cache is warmed and the VAE is freed; only then the transformer, LoRA and optimizer are loaded. Requires latent caching, a frozen text encoder and transformer LoRA. Sampling must be disabled.")
+                         tooltip="Loads the model in stages to save memory: the text cache is fully warmed with the text encoder not loaded (it is only loaded on demand if the cache is incomplete, then freed again); the same for the VAE and the image cache; only then the transformer, LoRA and optimizer are loaded. Sampling works too: the text encoder / VAE are temporarily reloaded for the sampling phases that need them and freed again afterwards. Requires latent caching, a frozen text encoder and transformer LoRA.")
         self.components.switch(frame, 3, 1, ui_state, "release_text_encoder_after_cache")
 
     def build_sampling_tab_header(self, top_frame, sub_frame, controller, ui_state):
