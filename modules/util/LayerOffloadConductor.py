@@ -666,6 +666,14 @@ class LayerOffloadConductor:
         torch_gc()
 
     def materialize(self):
+        # Idempotent: the trainer keeps the conductor active between steps, and samplers call
+        # materialize_only() before every sample. Re-running the full pass would re-allocate the
+        # pinned caches and re-clone every offloaded weight (a multi-GiB copy storm per sample);
+        # the layers are already placed, so an active conductor is a no-op. evict() clears the
+        # flag, so a real re-materialize after an evict still runs in full.
+        if self.__is_active:
+            return
+
         torch_gc()
 
         self.__wait_all_layer_transfers()

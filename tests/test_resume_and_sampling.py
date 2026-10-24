@@ -138,7 +138,14 @@ class _StubModel:
         return self._pipeline
 
     def materialize_only(self, *parts):
-        self.materialize_calls.append(parts)
+        self.materialize_calls.append(("only",) + parts)
+        if "vae" in parts and self.vae is None:
+            self.vae = _StubVae()
+
+    def materialize(self, *parts):
+        # the sampler materializes the VAE without evicting the transformer (the evict would
+        # clone every weight into RAM); the stub records the call shape
+        self.materialize_calls.append(("all",) + parts)
         if "vae" in parts and self.vae is None:
             self.vae = _StubVae()
 
@@ -187,6 +194,10 @@ class TestSamplerConditioningCache:
         assert sum("text_encoder" in p for p in model.materialize_calls) == first_te_materializations
         assert model.vae.decode_calls == 2
         assert transformer.calls == 4  # 2 steps per sample
+        # the VAE must be materialized WITHOUT evicting the transformer: an evict would clone
+        # every GGUF weight into RAM (the +16 GiB sampling peak)
+        assert ("all", "vae") in model.materialize_calls
+        assert ("only", "vae") not in model.materialize_calls
 
     def test_different_prompt_reencodes(self, tmp_path):
         model = _StubModel(_StubTransformer())

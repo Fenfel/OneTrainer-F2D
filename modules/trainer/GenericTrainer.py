@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import shutil
 import traceback
 import weakref
@@ -532,6 +533,27 @@ class GenericTrainer(BaseTrainer):
                     shutil.rmtree(path)
 
     @staticmethod
+    def __trim_working_set():
+        # After a release the garbage collector returns the tensors to the process heap, but the
+        # Windows working set keeps those pages committed, so the task manager (and our RSS
+        # snapshot) still shows them as used. SetProcessWorkingSetSizeEx(-1,-1, QUOTA_LIMITS_HARDWS_MIN_DISABLE)
+        # trims the working set and hands the free pages back to the OS.
+        if platform.system() != "Windows":
+            return
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # -1 pseudo-handles must be sign-extended: without restype/argtypes windll truncates
+            # them to 32-bit and the call fails with ERROR_INVALID_PARAMETER
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.SetProcessWorkingSetSizeEx.argtypes = [
+                ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_ssize_t, ctypes.c_uint32]
+            kernel32.SetProcessWorkingSetSizeEx.restype = ctypes.c_int
+            kernel32.SetProcessWorkingSetSizeEx(kernel32.GetCurrentProcess(), -1, -1, 0x00000001)
+        except Exception as e:  # best-effort diagnostics aid, never fatal
+            print(f"  (could not trim the working set: {e})")
+
+    @staticmethod
     def __memory_snapshot() -> str:
         # Diagnostics for release_text_encoder_after_cache: Windows RAM of this process and its
         # children (not system-wide memory), plus CUDA allocator allocated/reserved per device.
@@ -609,6 +631,7 @@ class GenericTrainer(BaseTrainer):
         model.text_encoder_released = True
 
         torch_gc()
+        self.__trim_working_set()
 
         print(f"  memory after release:  {self.__memory_snapshot()}")
         if text_encoder_ref is not None and text_encoder_ref() is not None:
@@ -633,6 +656,13 @@ class GenericTrainer(BaseTrainer):
         # copies of the batch-norm stats while the VAE is alive
         model.save_vae_bn_stats()
 
+        # same as the text encoder release: if the VAE ever runs under a conductor, its pinned
+        # allocator caches must be unregistered before the conductor is dropped
+        vae_conductor = getattr(model, "vae_offload_conductor", None)
+        if vae_conductor is not None:
+            vae_conductor.release()
+            model.vae_offload_conductor = None
+
         for module in self.__iter_pipeline_modules():
             if isinstance(module, (EncodeVAE, DecodeVAE, RandomLatentMaskRemove)):
                 module.vae = ReleasedVae()
@@ -641,6 +671,7 @@ class GenericTrainer(BaseTrainer):
         model.vae_released = True
 
         torch_gc()
+        self.__trim_working_set()
 
         print(f"  memory after release:  {self.__memory_snapshot()}")
         if vae_ref is not None and vae_ref() is not None:
@@ -674,6 +705,10 @@ class GenericTrainer(BaseTrainer):
         self.sample_queue.append(fun)
 
     def __execute_sample_during_training(self):
+        # runs on every training step; an empty queue must not open the recorder, otherwise its
+        # poll thread reports the current training RAM as a "sampling" peak on every step
+        if not self.sample_queue:
+            return
         with PeakMemoryRecorder("sampling", enabled=True):
             for fun in self.sample_queue:
                 fun()

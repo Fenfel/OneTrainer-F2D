@@ -148,7 +148,11 @@ class Flux2Sampler(BaseModelSampler):
 
                 on_update_progress(i + 1, len(timesteps))
 
-            self.model.materialize_only("vae")
+            # materialize (not materialize_only): the VAE is tiny compared to the transformer,
+            # and evicting the transformer here would clone every GGUF weight into RAM and back
+            # after the sample (the +20 GiB sampling peak). The trainer releases the VAE again
+            # after the sample; the transformer simply stays resident.
+            self.model.materialize("vae")
 
             latent_image = self.model.unpack_latents(
                 latent_image,
